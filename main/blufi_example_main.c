@@ -24,6 +24,8 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_bt.h"
+#include "driver/gpio.h"
+#include "esp_sleep.h"
 
 #include "esp_blufi_api.h"
 #include "blufi_example.h"
@@ -33,6 +35,11 @@
 #define EXAMPLE_WIFI_CONNECTION_MAXIMUM_RETRY CONFIG_EXAMPLE_WIFI_CONNECTION_MAXIMUM_RETRY
 #define EXAMPLE_INVALID_REASON 255
 #define EXAMPLE_INVALID_RSSI -128
+
+#define LOWER_BUTTON GPIO_NUM_35
+#define TOKEN_LENGTH 36
+#define DEEP_SLEEP_DURATION 30
+#define TOKEN_KEY "token_id"
 
 static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param);
 
@@ -470,6 +477,44 @@ static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_para
     case ESP_BLUFI_EVENT_RECV_CUSTOM_DATA:
         BLUFI_INFO("Recv Custom Data %d\n", param->custom_data.data_len);
         esp_log_buffer_hex("Custom Data", param->custom_data.data, param->custom_data.data_len);
+
+        if (param->custom_data.data_len != TOKEN_LENGTH)
+        {
+            printf("Custom data is not a token! length=%d\n", param->custom_data.data_len);
+            break;
+        }
+
+        printf("Opening Non-Volatile Storage (NVS) handle... ");
+        nvs_handle_t nvs;
+        esp_err_t ret = nvs_open("storage", NVS_READWRITE, &nvs);
+        if (ret != ESP_OK)
+        {
+            printf("Error (%s) opening NVS handle!\n", esp_err_to_name(ret));
+            break;
+        }
+        printf("Done\n");
+
+        char token[TOKEN_LENGTH + 1] = {0};
+        strncpy(token, (char *)param->custom_data.data, TOKEN_LENGTH);
+        token[TOKEN_LENGTH] = '\0';
+        printf("Token set to %s!\n", token);
+
+        // Write
+        printf("Updating token in NVS ... ");
+        ret = nvs_set_str(nvs, TOKEN_KEY, token);
+        printf((ret != ESP_OK) ? "Failed!\n" : "Done\n");
+
+        // Commit written value.
+        // After setting any values, nvs_commit() must be called to ensure changes are written
+        // to flash storage. Implementations may write to storage at other times,
+        // but this is not guaranteed.
+        printf("Committing updates in NVS ... ");
+        ret = nvs_commit(nvs);
+        printf((ret != ESP_OK) ? "Failed!\n" : "Done\n");
+
+        // Close
+        nvs_close(nvs);
+        esp_restart();
         break;
     case ESP_BLUFI_EVENT_RECV_USERNAME:
         /* Not handle currently */
@@ -499,8 +544,41 @@ void app_main(void)
 {
     esp_err_t ret;
 
-    // TODO: Remove me
-    ESP_ERROR_CHECK(nvs_flash_erase());
+    // Set lower button to input mode
+    gpio_set_direction(LOWER_BUTTON, GPIO_MODE_INPUT);
+
+    vTaskDelay(10);
+
+    // If the button is pressed during boot
+    int reset = !gpio_get_level(LOWER_BUTTON);
+    if (reset)
+    {
+        // Reset flash
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+
+        nvs_handle_t nvs;
+        ESP_ERROR_CHECK(nvs_open("storage", NVS_READWRITE, &nvs));
+        ESP_ERROR_CHECK(nvs_erase_all(nvs));
+        ESP_ERROR_CHECK(nvs_commit(nvs));
+        nvs_close(nvs);
+
+        vTaskDelay(10);
+
+        // Wait until the button is released
+        do
+        {
+            reset = !gpio_get_level(LOWER_BUTTON);
+            BLUFI_INFO("Waiting for release..");
+            vTaskDelay(1);
+        } while (reset);
+
+        vTaskDelay(100);
+
+        // Restart esp
+        BLUFI_INFO("Restart..");
+        esp_restart();
+    }
 
     // Initialize NVS
     ret = nvs_flash_init();
@@ -511,8 +589,43 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    // Start wifi
     initialise_wifi();
 
+    // Read if we have a token
+    nvs_handle_t nvs;
+    ret = nvs_open("storage", NVS_READWRITE, &nvs);
+    if (ret != ESP_OK)
+    {
+        printf("Error (%s) opening NVS handle!\n", esp_err_to_name(ret));
+        return;
+    }
+
+    // Read
+    size_t required_size = 100;
+    char *token = malloc(required_size);
+    ret = nvs_get_str(nvs, TOKEN_KEY, token, &required_size);
+
+    // Close
+    nvs_close(nvs);
+
+    if (ret == ESP_OK)
+    {
+        // Connect to server and enter deepsleep directly.
+        printf("Token value: %s\n", token);
+
+        free(token);
+        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION * 1000000));
+        esp_deep_sleep_start();
+        return;
+    }
+    else
+    {
+        BLUFI_ERROR("%s read token failed: %s\n", __func__, esp_err_to_name(ret));
+    }
+    free(token);
+
+    // Continue with enabling bluetooth
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
@@ -537,4 +650,11 @@ void app_main(void)
     }
 
     BLUFI_INFO("BLUFI VERSION %04x\n", esp_blufi_get_version());
+
+    // Delay for 5 minutes
+    vTaskDelay(5 * 60 * 1000 / portTICK_PERIOD_MS);
+
+    // Enter deep sleep
+    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION * 1000000));
+    esp_deep_sleep_start();
 }
