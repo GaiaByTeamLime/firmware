@@ -26,11 +26,20 @@
 #include "esp_bt.h"
 #include "driver/gpio.h"
 #include "esp_sleep.h"
+#include "esp_tls.h"
+#include "esp_crt_bundle.h"
+#include "esp_http_client.h"
+#define MAX_HTTP_RECV_BUFFER 512
+#define MAX_HTTP_OUTPUT_BUFFER 2048
+static const char *TAG = "HTTP_CLIENT";
 
 #include "esp_blufi_api.h"
 #include "blufi_example.h"
 
 #include "esp_blufi.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
 
 #define EXAMPLE_WIFI_CONNECTION_MAXIMUM_RETRY CONFIG_EXAMPLE_WIFI_CONNECTION_MAXIMUM_RETRY
 #define EXAMPLE_INVALID_REASON 255
@@ -40,6 +49,8 @@
 #define TOKEN_LENGTH 36
 #define DEEP_SLEEP_DURATION 30
 #define TOKEN_KEY "token_id"
+#define MAC_KEY "mac_key"
+#define TEMPORAL_BASE_URL "https://temporal.dev.gaiaplant.app"
 
 static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param);
 
@@ -68,6 +79,92 @@ static int gl_sta_ssid_len;
 static wifi_sta_list_t gl_sta_list;
 static bool gl_sta_is_connecting = false;
 static esp_blufi_extra_info_t gl_sta_conn_info;
+
+esp_err_t _http_event_handler(esp_http_client_event_t *evt)
+{
+    static char *output_buffer; // Buffer to store response of http request from event handler
+    static int output_len;      // Stores number of bytes read
+    switch (evt->event_id)
+    {
+    case HTTP_EVENT_ERROR:
+        ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
+        break;
+    case HTTP_EVENT_ON_CONNECTED:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
+        break;
+    case HTTP_EVENT_HEADER_SENT:
+        ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
+        break;
+    case HTTP_EVENT_ON_HEADER:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+        break;
+    case HTTP_EVENT_ON_DATA:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+        /*
+         *  Check for chunked encoding is added as the URL for chunked encoding used in this example returns binary data.
+         *  However, event handler can also be used in case chunked encoding is used.
+         */
+        if (!esp_http_client_is_chunked_response(evt->client))
+        {
+            // If user_data buffer is configured, copy the response into the buffer
+            if (evt->user_data)
+            {
+                memcpy(evt->user_data + output_len, evt->data, evt->data_len);
+            }
+            else
+            {
+                if (output_buffer == NULL)
+                {
+                    output_buffer = (char *)malloc(esp_http_client_get_content_length(evt->client));
+                    output_len = 0;
+                    if (output_buffer == NULL)
+                    {
+                        ESP_LOGE(TAG, "Failed to allocate memory for output buffer");
+                        return ESP_FAIL;
+                    }
+                }
+                memcpy(output_buffer + output_len, evt->data, evt->data_len);
+            }
+            output_len += evt->data_len;
+        }
+
+        break;
+    case HTTP_EVENT_ON_FINISH:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
+        if (output_buffer != NULL)
+        {
+            // Response is accumulated in output_buffer. Uncomment the below line to print the accumulated response
+            // ESP_LOG_BUFFER_HEX(TAG, output_buffer, output_len);
+            free(output_buffer);
+            output_buffer = NULL;
+        }
+        output_len = 0;
+        break;
+    case HTTP_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
+        int mbedtls_err = 0;
+        esp_err_t err = esp_tls_get_and_clear_last_error((esp_tls_error_handle_t)evt->data, &mbedtls_err, NULL);
+        if (err != 0)
+        {
+            ESP_LOGI(TAG, "Last esp error code: 0x%x", err);
+            ESP_LOGI(TAG, "Last mbedtls failure: 0x%x", mbedtls_err);
+        }
+        if (output_buffer != NULL)
+        {
+            free(output_buffer);
+            output_buffer = NULL;
+        }
+        output_len = 0;
+        break;
+    case HTTP_EVENT_REDIRECT:
+        ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
+        esp_http_client_set_header(evt->client, "From", "user@example.com");
+        esp_http_client_set_header(evt->client, "Accept", "text/html");
+        esp_http_client_set_redirection(evt->client);
+        break;
+    }
+    return ESP_OK;
+}
 
 static void example_record_wifi_conn_info(int rssi, uint8_t reason)
 {
@@ -152,6 +249,7 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
         {
             BLUFI_INFO("BLUFI BLE is not connected yet\n");
         }
+
         break;
     }
     default:
@@ -504,6 +602,15 @@ static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_para
         ret = nvs_set_str(nvs, TOKEN_KEY, token);
         printf((ret != ESP_OK) ? "Failed!\n" : "Done\n");
 
+        char mac[50] = {0};
+        sprintf(mac, ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(esp_bt_dev_get_address()));
+        BLUFI_INFO("MAC: %s\n", mac);
+
+        // Write
+        printf("Updating mac in NVS ... ");
+        ret = nvs_set_str(nvs, MAC_KEY, mac);
+        printf((ret != ESP_OK) ? "Failed!\n" : "Done\n");
+
         // Commit written value.
         // After setting any values, nvs_commit() must be called to ensure changes are written
         // to flash storage. Implementations may write to storage at other times,
@@ -563,8 +670,6 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_commit(nvs));
         nvs_close(nvs);
 
-        vTaskDelay(10);
-
         // Wait until the button is released
         do
         {
@@ -572,8 +677,6 @@ void app_main(void)
             BLUFI_INFO("Waiting for release..");
             vTaskDelay(1);
         } while (reset);
-
-        vTaskDelay(100);
 
         // Restart esp
         BLUFI_INFO("Restart..");
@@ -606,6 +709,9 @@ void app_main(void)
     char *token = malloc(required_size);
     ret = nvs_get_str(nvs, TOKEN_KEY, token, &required_size);
 
+    char *mac = malloc(required_size);
+    ret += nvs_get_str(nvs, MAC_KEY, mac, &required_size);
+
     // Close
     nvs_close(nvs);
 
@@ -613,48 +719,90 @@ void app_main(void)
     {
         // Connect to server and enter deepsleep directly.
         printf("Token value: %s\n", token);
+        printf("Mac value: %s\n", mac);
+
+        while (!gl_sta_got_ip)
+        {
+            vTaskDelay(100);
+        }
+
+        char url[100];
+        sprintf(url, "%s/log/%s", TEMPORAL_BASE_URL, mac);
+        printf("Url is %s\n", url);
+
+        char auth_header[100];
+        sprintf(auth_header, "Bearer %s", token);
+        printf("Auth header is is %s\n", auth_header);
+
+        const char *post_data = "{\"illumination\":1,\"humidity\":2,\"temperature\":3,\"voltage\":4,\"soilHumidity\":5,\"soilSalt\":6}";
+
+        esp_http_client_config_t config = {
+            .url = url,
+            .event_handler = _http_event_handler,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        esp_http_client_set_method(client, HTTP_METHOD_POST);
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_header(client, "Authorization", auth_header);
+        esp_http_client_set_post_field(client, post_data, strlen(post_data));
+        esp_err_t err = esp_http_client_perform(client);
+
+        if (err == ESP_OK)
+        {
+            ESP_LOGI(TAG, "HTTPS Status = %d, content_length = %lld",
+                     esp_http_client_get_status_code(client),
+                     esp_http_client_get_content_length(client));
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Error perform http request %s", esp_err_to_name(err));
+        }
+        esp_http_client_cleanup(client);
 
         free(token);
+        free(mac);
+        // Enter deep sleep
         ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION * 1000000));
         esp_deep_sleep_start();
-        return;
     }
     else
     {
-        BLUFI_ERROR("%s read token failed: %s\n", __func__, esp_err_to_name(ret));
+        free(token);
+        free(mac);
+        BLUFI_ERROR("%s read token failed.\n", __func__);
+
+        // Continue with enabling bluetooth
+        ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+
+        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+        ret = esp_bt_controller_init(&bt_cfg);
+        if (ret)
+        {
+            BLUFI_ERROR("%s initialize bt controller failed: %s\n", __func__, esp_err_to_name(ret));
+        }
+
+        ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+        if (ret)
+        {
+            BLUFI_ERROR("%s enable bt controller failed: %s\n", __func__, esp_err_to_name(ret));
+            return;
+        }
+
+        ret = esp_blufi_host_and_cb_init(&example_callbacks);
+        if (ret)
+        {
+            BLUFI_ERROR("%s initialise failed: %s\n", __func__, esp_err_to_name(ret));
+            return;
+        }
+
+        BLUFI_INFO("BLUFI VERSION %04x\n", esp_blufi_get_version());
+
+        // Delay for 5 minutes
+        vTaskDelay(5 * 60 * 1000 / portTICK_PERIOD_MS);
+
+        // Enter deep sleep
+        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION * 1000000));
+        esp_deep_sleep_start();
     }
-    free(token);
-
-    // Continue with enabling bluetooth
-    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
-
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ret = esp_bt_controller_init(&bt_cfg);
-    if (ret)
-    {
-        BLUFI_ERROR("%s initialize bt controller failed: %s\n", __func__, esp_err_to_name(ret));
-    }
-
-    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (ret)
-    {
-        BLUFI_ERROR("%s enable bt controller failed: %s\n", __func__, esp_err_to_name(ret));
-        return;
-    }
-
-    ret = esp_blufi_host_and_cb_init(&example_callbacks);
-    if (ret)
-    {
-        BLUFI_ERROR("%s initialise failed: %s\n", __func__, esp_err_to_name(ret));
-        return;
-    }
-
-    BLUFI_INFO("BLUFI VERSION %04x\n", esp_blufi_get_version());
-
-    // Delay for 5 minutes
-    vTaskDelay(5 * 60 * 1000 / portTICK_PERIOD_MS);
-
-    // Enter deep sleep
-    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION * 1000000));
-    esp_deep_sleep_start();
 }
