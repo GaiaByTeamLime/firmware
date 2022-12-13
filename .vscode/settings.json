@@ -3,5 +3,9 @@
     "idf.adapterTargetName": "esp32",
     "idf.port": "/dev/ttyACM0",
     "idf.flashType": "UART",
-    "C_Cpp.errorSquiggles": "disabled"
+    "C_Cpp.errorSquiggles": "disabled",
+    "files.associations": {
+        "esp_http_client.h": "c",
+        "dht.h": "c"
+    }
 }

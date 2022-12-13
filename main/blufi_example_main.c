@@ -29,9 +29,7 @@
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
-#define MAX_HTTP_RECV_BUFFER 512
-#define MAX_HTTP_OUTPUT_BUFFER 2048
-static const char *TAG = "HTTP_CLIENT";
+#include <bh1750.h>
 
 #include "esp_blufi_api.h"
 #include "blufi_example.h"
@@ -40,6 +38,12 @@ static const char *TAG = "HTTP_CLIENT";
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
+#include "dht11.h"
+#include <driver/adc.h>
+
+#define MAX_HTTP_RECV_BUFFER 512
+#define MAX_HTTP_OUTPUT_BUFFER 2048
+static const char *TAG = "HTTP_CLIENT";
 
 #define EXAMPLE_WIFI_CONNECTION_MAXIMUM_RETRY CONFIG_EXAMPLE_WIFI_CONNECTION_MAXIMUM_RETRY
 #define EXAMPLE_INVALID_REASON 255
@@ -47,10 +51,14 @@ static const char *TAG = "HTTP_CLIENT";
 
 #define LOWER_BUTTON GPIO_NUM_35
 #define TOKEN_LENGTH 36
-#define DEEP_SLEEP_DURATION 30
+#define DEEP_SLEEP_DURATION 30 * 60
 #define TOKEN_KEY "token_id"
 #define MAC_KEY "mac_key"
 #define TEMPORAL_BASE_URL "https://temporal.dev.gaiaplant.app"
+#define SENSOR_TYPE DHT_TYPE_DHT11
+#define DHT11_DATA_GPIO GPIO_NUM_16
+#define I2C_MASTER_SDA GPIO_NUM_25
+#define I2C_MASTER_SCL GPIO_NUM_26
 
 static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param);
 
@@ -647,6 +655,8 @@ static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_para
     }
 }
 
+static struct dht11_reading stDht11Reading;
+
 void app_main(void)
 {
     esp_err_t ret;
@@ -721,10 +731,72 @@ void app_main(void)
         printf("Token value: %s\n", token);
         printf("Mac value: %s\n", mac);
 
-        while (!gl_sta_got_ip)
+        // FIRST ENABLE THE SENSORS JESSE
+        gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+        gpio_set_level(GPIO_NUM_4, 1);
+        vTaskDelay(100);
+
+        ESP_ERROR_CHECK(i2cdev_init());
+
+        i2c_dev_t dev;
+        memset(&dev, 0, sizeof(i2c_dev_t));
+
+        ESP_ERROR_CHECK(bh1750_init_desc(&dev, BH1750_ADDR_LO, 0, I2C_MASTER_SDA, I2C_MASTER_SCL));
+        ESP_ERROR_CHECK(bh1750_setup(&dev, BH1750_MODE_CONTINUOUS, BH1750_RES_HIGH));
+
+        int tries = 0;
+
+        DHT11_init(DHT11_DATA_GPIO);
+        // vTaskDelay(2500 / portTICK_PERIOD_MS);
+        do
         {
-            vTaskDelay(100);
+            stDht11Reading = DHT11_read();
+
+            if (DHT11_OK == stDht11Reading.status)
+            {
+                ESP_LOGI(TAG,
+                         "Temperature: %d °C\tHumidity: %d %%",
+                         stDht11Reading.temperature,
+                         stDht11Reading.humidity);
+            }
+            else
+            {
+                ESP_LOGW(TAG,
+                         "Cannot read from sensor: %s",
+                         (DHT11_TIMEOUT_ERROR == stDht11Reading.status)
+                             ? "Timeout"
+                             : "Bad CRC");
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            tries++;
+        } while (DHT11_OK != stDht11Reading.status && tries < 50);
+
+        tries = 0;
+        uint16_t lux;
+
+        while (lux == 0 && tries < 50)
+        {
+            if (bh1750_read(&dev, &lux) != ESP_OK)
+                printf("Could not read lux data\n");
+            else
+                printf("Lux: %d\n", lux);
+            vTaskDelay(pdMS_TO_TICKS(20));
+            tries++;
         }
+
+        adc1_config_width(ADC_WIDTH_BIT_12);
+        adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_11); // capacitibe
+        adc1_config_channel_atten(ADC1_CHANNEL_5, ADC_ATTEN_DB_11); // vbat
+        adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_0);  // resistive
+
+        int soil_humid = adc1_get_raw(ADC1_CHANNEL_4);
+        int bat = adc1_get_raw(ADC1_CHANNEL_5);
+        int soil_salt = adc1_get_raw(ADC1_CHANNEL_6);
+
+        // ESP_LOGI(TAG, "ADC1_CHANNEL_4: %d mV", adc1_get_raw(ADC1_CHANNEL_4));
+        printf("yoo %d\n", soil_humid);
+        // ESP_LOGI(TAG, "ADC1_CHANNEL_5: %d mV", adc1_get_raw(ADC1_CHANNEL_5));
+        printf("yoo %d\n", bat);
 
         char url[100];
         sprintf(url, "%s/log/%s", TEMPORAL_BASE_URL, mac);
@@ -734,7 +806,17 @@ void app_main(void)
         sprintf(auth_header, "Bearer %s", token);
         printf("Auth header is is %s\n", auth_header);
 
-        const char *post_data = "{\"illumination\":1,\"humidity\":2,\"temperature\":3,\"voltage\":4,\"soilHumidity\":5,\"soilSalt\":6}";
+        char post_data[200];
+        sprintf(post_data,
+                "{\"illumination\":%d,\"humidity\":%d,\"temperature\":%d,\"voltage\":%d,\"soilHumidity\":%d,\"soilSalt\":%d}",
+                lux, stDht11Reading.humidity, stDht11Reading.temperature, bat, soil_humid, soil_salt);
+
+        printf("Post data is %s\n", post_data);
+
+        while (!gl_sta_got_ip)
+        {
+            vTaskDelay(10);
+        }
 
         esp_http_client_config_t config = {
             .url = url,
@@ -743,9 +825,9 @@ void app_main(void)
         };
         esp_http_client_handle_t client = esp_http_client_init(&config);
         esp_http_client_set_method(client, HTTP_METHOD_POST);
+        esp_http_client_set_post_field(client, post_data, strlen(post_data));
         esp_http_client_set_header(client, "Content-Type", "application/json");
         esp_http_client_set_header(client, "Authorization", auth_header);
-        esp_http_client_set_post_field(client, post_data, strlen(post_data));
         esp_err_t err = esp_http_client_perform(client);
 
         if (err == ESP_OK)
@@ -762,6 +844,7 @@ void app_main(void)
 
         free(token);
         free(mac);
+
         // Enter deep sleep
         ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION * 1000000));
         esp_deep_sleep_start();
