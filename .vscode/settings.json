@@ -6,6 +6,14 @@
     "C_Cpp.errorSquiggles": "disabled",
     "files.associations": {
         "esp_http_client.h": "c",
-        "dht.h": "c"
+        "dht.h": "c",
+        "random": "cpp",
+        "blufi.h": "c",
+        "blufi_main.h": "c",
+        "blufi_init.h": "c",
+        "blufi_security.h": "c",
+        "wifi.h": "c",
+        "esp_blufi.h": "c",
+        "gaia.h": "c"
     }
 }

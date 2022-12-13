@@ -11,58 +11,10 @@
  * iOS source code: https://github.com/EspressifApp/EspBlufiForiOS
  ****************************************************************************/
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "esp_system.h"
-#include "esp_mac.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_log.h"
-#include "nvs_flash.h"
-#include "esp_bt.h"
-#include "driver/gpio.h"
-#include "esp_sleep.h"
-#include "esp_tls.h"
-#include "esp_crt_bundle.h"
-#include "esp_http_client.h"
-#include <bh1750.h>
-
-#include "esp_blufi_api.h"
-#include "blufi_example.h"
-
-#include "esp_blufi.h"
-#include "esp_bt.h"
-#include "esp_bt_main.h"
-#include "esp_bt_device.h"
-#include "dht11.h"
-#include <driver/adc.h>
-
-#define MAX_HTTP_RECV_BUFFER 512
-#define MAX_HTTP_OUTPUT_BUFFER 2048
-static const char *TAG = "HTTP_CLIENT";
-
-#define EXAMPLE_WIFI_CONNECTION_MAXIMUM_RETRY CONFIG_EXAMPLE_WIFI_CONNECTION_MAXIMUM_RETRY
-#define EXAMPLE_INVALID_REASON 255
-#define EXAMPLE_INVALID_RSSI -128
-
-#define LOWER_BUTTON GPIO_NUM_35
-#define TOKEN_LENGTH 36
-#define DEEP_SLEEP_DURATION 30 * 60
-#define TOKEN_KEY "token_id"
-#define MAC_KEY "mac_key"
-#define TEMPORAL_BASE_URL "https://temporal.dev.gaiaplant.app"
-#define SENSOR_TYPE DHT_TYPE_DHT11
-#define DHT11_DATA_GPIO GPIO_NUM_16
-#define I2C_MASTER_SDA GPIO_NUM_25
-#define I2C_MASTER_SCL GPIO_NUM_26
-
-static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param);
-
-#define WIFI_LIST_NUM 10
+#include "blufi_main.h"
+static const char *TAG = "BLUFI_MAIN";
+static bool gl_sta_got_ip = false;
+static void (*_wifi_connect_callback)();
 
 static wifi_config_t sta_config;
 static wifi_config_t ap_config;
@@ -79,7 +31,6 @@ static uint8_t example_wifi_retry = 0;
 
 /* store the station info for send back to phone */
 static bool gl_sta_connected = false;
-static bool gl_sta_got_ip = false;
 static bool ble_is_connected = false;
 static uint8_t gl_sta_bssid[6];
 static uint8_t gl_sta_ssid[32];
@@ -87,92 +38,6 @@ static int gl_sta_ssid_len;
 static wifi_sta_list_t gl_sta_list;
 static bool gl_sta_is_connecting = false;
 static esp_blufi_extra_info_t gl_sta_conn_info;
-
-esp_err_t _http_event_handler(esp_http_client_event_t *evt)
-{
-    static char *output_buffer; // Buffer to store response of http request from event handler
-    static int output_len;      // Stores number of bytes read
-    switch (evt->event_id)
-    {
-    case HTTP_EVENT_ERROR:
-        ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
-        break;
-    case HTTP_EVENT_ON_CONNECTED:
-        ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
-        break;
-    case HTTP_EVENT_HEADER_SENT:
-        ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
-        break;
-    case HTTP_EVENT_ON_HEADER:
-        ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
-        break;
-    case HTTP_EVENT_ON_DATA:
-        ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-        /*
-         *  Check for chunked encoding is added as the URL for chunked encoding used in this example returns binary data.
-         *  However, event handler can also be used in case chunked encoding is used.
-         */
-        if (!esp_http_client_is_chunked_response(evt->client))
-        {
-            // If user_data buffer is configured, copy the response into the buffer
-            if (evt->user_data)
-            {
-                memcpy(evt->user_data + output_len, evt->data, evt->data_len);
-            }
-            else
-            {
-                if (output_buffer == NULL)
-                {
-                    output_buffer = (char *)malloc(esp_http_client_get_content_length(evt->client));
-                    output_len = 0;
-                    if (output_buffer == NULL)
-                    {
-                        ESP_LOGE(TAG, "Failed to allocate memory for output buffer");
-                        return ESP_FAIL;
-                    }
-                }
-                memcpy(output_buffer + output_len, evt->data, evt->data_len);
-            }
-            output_len += evt->data_len;
-        }
-
-        break;
-    case HTTP_EVENT_ON_FINISH:
-        ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
-        if (output_buffer != NULL)
-        {
-            // Response is accumulated in output_buffer. Uncomment the below line to print the accumulated response
-            // ESP_LOG_BUFFER_HEX(TAG, output_buffer, output_len);
-            free(output_buffer);
-            output_buffer = NULL;
-        }
-        output_len = 0;
-        break;
-    case HTTP_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
-        int mbedtls_err = 0;
-        esp_err_t err = esp_tls_get_and_clear_last_error((esp_tls_error_handle_t)evt->data, &mbedtls_err, NULL);
-        if (err != 0)
-        {
-            ESP_LOGI(TAG, "Last esp error code: 0x%x", err);
-            ESP_LOGI(TAG, "Last mbedtls failure: 0x%x", mbedtls_err);
-        }
-        if (output_buffer != NULL)
-        {
-            free(output_buffer);
-            output_buffer = NULL;
-        }
-        output_len = 0;
-        break;
-    case HTTP_EVENT_REDIRECT:
-        ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
-        esp_http_client_set_header(evt->client, "From", "user@example.com");
-        esp_http_client_set_header(evt->client, "Accept", "text/html");
-        esp_http_client_set_redirection(evt->client);
-        break;
-    }
-    return ESP_OK;
-}
 
 static void example_record_wifi_conn_info(int rssi, uint8_t reason)
 {
@@ -257,6 +122,10 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
         {
             BLUFI_INFO("BLUFI BLE is not connected yet\n");
         }
+
+        printf("calling connect callback");
+        _wifi_connect_callback();
+        printf("connect callback called.");
 
         break;
     }
@@ -398,7 +267,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     return;
 }
 
-static void initialise_wifi(void)
+void initialise_wifi(void (*wifi_connected_callback)())
 {
     ESP_ERROR_CHECK(esp_netif_init());
     wifi_event_group = xEventGroupCreate();
@@ -407,6 +276,7 @@ static void initialise_wifi(void)
     assert(sta_netif);
     esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
     assert(ap_netif);
+    _wifi_connect_callback = wifi_connected_callback;
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
 
@@ -418,15 +288,7 @@ static void initialise_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-static esp_blufi_callbacks_t example_callbacks = {
-    .event_cb = example_event_callback,
-    .negotiate_data_handler = blufi_dh_negotiate_data_handler,
-    .encrypt_func = blufi_aes_encrypt,
-    .decrypt_func = blufi_aes_decrypt,
-    .checksum_func = blufi_crc_checksum,
-};
-
-static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
+void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
 {
     /* actually, should post to blufi_task handle the procedure,
      * now, as a example, we do it more simply */
@@ -434,7 +296,6 @@ static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_para
     {
     case ESP_BLUFI_EVENT_INIT_FINISH:
         BLUFI_INFO("BLUFI init finish\n");
-        BLUFI_INFO("Setting name to %s\n", BLUFI_DEVICE_NAME);
         esp_blufi_adv_start();
         break;
     case ESP_BLUFI_EVENT_DEINIT_FINISH:
@@ -584,52 +445,7 @@ static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_para
         BLUFI_INFO("Recv Custom Data %d\n", param->custom_data.data_len);
         esp_log_buffer_hex("Custom Data", param->custom_data.data, param->custom_data.data_len);
 
-        if (param->custom_data.data_len != TOKEN_LENGTH)
-        {
-            printf("Custom data is not a token! length=%d\n", param->custom_data.data_len);
-            break;
-        }
-
-        printf("Opening Non-Volatile Storage (NVS) handle... ");
-        nvs_handle_t nvs;
-        esp_err_t ret = nvs_open("storage", NVS_READWRITE, &nvs);
-        if (ret != ESP_OK)
-        {
-            printf("Error (%s) opening NVS handle!\n", esp_err_to_name(ret));
-            break;
-        }
-        printf("Done\n");
-
-        char token[TOKEN_LENGTH + 1] = {0};
-        strncpy(token, (char *)param->custom_data.data, TOKEN_LENGTH);
-        token[TOKEN_LENGTH] = '\0';
-        printf("Token set to %s!\n", token);
-
-        // Write
-        printf("Updating token in NVS ... ");
-        ret = nvs_set_str(nvs, TOKEN_KEY, token);
-        printf((ret != ESP_OK) ? "Failed!\n" : "Done\n");
-
-        char mac[50] = {0};
-        sprintf(mac, ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(esp_bt_dev_get_address()));
-        BLUFI_INFO("MAC: %s\n", mac);
-
-        // Write
-        printf("Updating mac in NVS ... ");
-        ret = nvs_set_str(nvs, MAC_KEY, mac);
-        printf((ret != ESP_OK) ? "Failed!\n" : "Done\n");
-
-        // Commit written value.
-        // After setting any values, nvs_commit() must be called to ensure changes are written
-        // to flash storage. Implementations may write to storage at other times,
-        // but this is not guaranteed.
-        printf("Committing updates in NVS ... ");
-        ret = nvs_commit(nvs);
-        printf((ret != ESP_OK) ? "Failed!\n" : "Done\n");
-
-        // Close
-        nvs_close(nvs);
-        esp_restart();
+        handle_custom_data(param);
         break;
     case ESP_BLUFI_EVENT_RECV_USERNAME:
         /* Not handle currently */
@@ -652,240 +468,5 @@ static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_para
         break;
     default:
         break;
-    }
-}
-
-static struct dht11_reading stDht11Reading;
-
-void app_main(void)
-{
-    esp_err_t ret;
-
-    // Set lower button to input mode
-    gpio_set_direction(LOWER_BUTTON, GPIO_MODE_INPUT);
-
-    vTaskDelay(10);
-
-    // If the button is pressed during boot
-    int reset = !gpio_get_level(LOWER_BUTTON);
-    if (reset)
-    {
-        // Reset flash
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ESP_ERROR_CHECK(nvs_flash_init());
-
-        nvs_handle_t nvs;
-        ESP_ERROR_CHECK(nvs_open("storage", NVS_READWRITE, &nvs));
-        ESP_ERROR_CHECK(nvs_erase_all(nvs));
-        ESP_ERROR_CHECK(nvs_commit(nvs));
-        nvs_close(nvs);
-
-        // Wait until the button is released
-        do
-        {
-            reset = !gpio_get_level(LOWER_BUTTON);
-            BLUFI_INFO("Waiting for release..");
-            vTaskDelay(1);
-        } while (reset);
-
-        // Restart esp
-        BLUFI_INFO("Restart..");
-        esp_restart();
-    }
-
-    // Initialize NVS
-    ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    // Start wifi
-    initialise_wifi();
-
-    // Read if we have a token
-    nvs_handle_t nvs;
-    ret = nvs_open("storage", NVS_READWRITE, &nvs);
-    if (ret != ESP_OK)
-    {
-        printf("Error (%s) opening NVS handle!\n", esp_err_to_name(ret));
-        return;
-    }
-
-    // Read
-    size_t required_size = 100;
-    char *token = malloc(required_size);
-    ret = nvs_get_str(nvs, TOKEN_KEY, token, &required_size);
-
-    char *mac = malloc(required_size);
-    ret += nvs_get_str(nvs, MAC_KEY, mac, &required_size);
-
-    // Close
-    nvs_close(nvs);
-
-    if (ret == ESP_OK)
-    {
-        // Connect to server and enter deepsleep directly.
-        printf("Token value: %s\n", token);
-        printf("Mac value: %s\n", mac);
-
-        // FIRST ENABLE THE SENSORS JESSE
-        gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
-        gpio_set_level(GPIO_NUM_4, 1);
-        vTaskDelay(100);
-
-        ESP_ERROR_CHECK(i2cdev_init());
-
-        i2c_dev_t dev;
-        memset(&dev, 0, sizeof(i2c_dev_t));
-
-        ESP_ERROR_CHECK(bh1750_init_desc(&dev, BH1750_ADDR_LO, 0, I2C_MASTER_SDA, I2C_MASTER_SCL));
-        ESP_ERROR_CHECK(bh1750_setup(&dev, BH1750_MODE_CONTINUOUS, BH1750_RES_HIGH));
-
-        int tries = 0;
-
-        DHT11_init(DHT11_DATA_GPIO);
-        // vTaskDelay(2500 / portTICK_PERIOD_MS);
-        do
-        {
-            stDht11Reading = DHT11_read();
-
-            if (DHT11_OK == stDht11Reading.status)
-            {
-                ESP_LOGI(TAG,
-                         "Temperature: %d °C\tHumidity: %d %%",
-                         stDht11Reading.temperature,
-                         stDht11Reading.humidity);
-            }
-            else
-            {
-                ESP_LOGW(TAG,
-                         "Cannot read from sensor: %s",
-                         (DHT11_TIMEOUT_ERROR == stDht11Reading.status)
-                             ? "Timeout"
-                             : "Bad CRC");
-            }
-            vTaskDelay(pdMS_TO_TICKS(20));
-            tries++;
-        } while (DHT11_OK != stDht11Reading.status && tries < 50);
-
-        tries = 0;
-        uint16_t lux;
-
-        while (lux == 0 && tries < 50)
-        {
-            if (bh1750_read(&dev, &lux) != ESP_OK)
-                printf("Could not read lux data\n");
-            else
-                printf("Lux: %d\n", lux);
-            vTaskDelay(pdMS_TO_TICKS(20));
-            tries++;
-        }
-
-        adc1_config_width(ADC_WIDTH_BIT_12);
-        adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_11); // capacitibe
-        adc1_config_channel_atten(ADC1_CHANNEL_5, ADC_ATTEN_DB_11); // vbat
-        adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_0);  // resistive
-
-        int soil_humid = adc1_get_raw(ADC1_CHANNEL_4);
-        int bat = adc1_get_raw(ADC1_CHANNEL_5);
-        int soil_salt = adc1_get_raw(ADC1_CHANNEL_6);
-
-        // ESP_LOGI(TAG, "ADC1_CHANNEL_4: %d mV", adc1_get_raw(ADC1_CHANNEL_4));
-        printf("yoo %d\n", soil_humid);
-        // ESP_LOGI(TAG, "ADC1_CHANNEL_5: %d mV", adc1_get_raw(ADC1_CHANNEL_5));
-        printf("yoo %d\n", bat);
-
-        char url[100];
-        sprintf(url, "%s/log/%s", TEMPORAL_BASE_URL, mac);
-        printf("Url is %s\n", url);
-
-        char auth_header[100];
-        sprintf(auth_header, "Bearer %s", token);
-        printf("Auth header is is %s\n", auth_header);
-
-        char post_data[200];
-        sprintf(post_data,
-                "{\"illumination\":%d,\"humidity\":%d,\"temperature\":%d,\"voltage\":%d,\"soilHumidity\":%d,\"soilSalt\":%d}",
-                lux, stDht11Reading.humidity, stDht11Reading.temperature, bat, soil_humid, soil_salt);
-
-        printf("Post data is %s\n", post_data);
-
-        while (!gl_sta_got_ip)
-        {
-            vTaskDelay(10);
-        }
-
-        esp_http_client_config_t config = {
-            .url = url,
-            .event_handler = _http_event_handler,
-            .crt_bundle_attach = esp_crt_bundle_attach,
-        };
-        esp_http_client_handle_t client = esp_http_client_init(&config);
-        esp_http_client_set_method(client, HTTP_METHOD_POST);
-        esp_http_client_set_post_field(client, post_data, strlen(post_data));
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        esp_http_client_set_header(client, "Authorization", auth_header);
-        esp_err_t err = esp_http_client_perform(client);
-
-        if (err == ESP_OK)
-        {
-            ESP_LOGI(TAG, "HTTPS Status = %d, content_length = %lld",
-                     esp_http_client_get_status_code(client),
-                     esp_http_client_get_content_length(client));
-        }
-        else
-        {
-            ESP_LOGE(TAG, "Error perform http request %s", esp_err_to_name(err));
-        }
-        esp_http_client_cleanup(client);
-
-        free(token);
-        free(mac);
-
-        // Enter deep sleep
-        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION * 1000000));
-        esp_deep_sleep_start();
-    }
-    else
-    {
-        free(token);
-        free(mac);
-        BLUFI_ERROR("%s read token failed.\n", __func__);
-
-        // Continue with enabling bluetooth
-        ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
-
-        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-        ret = esp_bt_controller_init(&bt_cfg);
-        if (ret)
-        {
-            BLUFI_ERROR("%s initialize bt controller failed: %s\n", __func__, esp_err_to_name(ret));
-        }
-
-        ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-        if (ret)
-        {
-            BLUFI_ERROR("%s enable bt controller failed: %s\n", __func__, esp_err_to_name(ret));
-            return;
-        }
-
-        ret = esp_blufi_host_and_cb_init(&example_callbacks);
-        if (ret)
-        {
-            BLUFI_ERROR("%s initialise failed: %s\n", __func__, esp_err_to_name(ret));
-            return;
-        }
-
-        BLUFI_INFO("BLUFI VERSION %04x\n", esp_blufi_get_version());
-
-        // Delay for 5 minutes
-        vTaskDelay(5 * 60 * 1000 / portTICK_PERIOD_MS);
-
-        // Enter deep sleep
-        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION * 1000000));
-        esp_deep_sleep_start();
     }
 }

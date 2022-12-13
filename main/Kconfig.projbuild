@@ -1,10 +1,56 @@
-menu "Example Configuration"
+menu "LILYGO TT-GO T-HiGrow hardware configuration"
 
-    config EXAMPLE_WIFI_CONNECTION_MAXIMUM_RETRY
+    config WIFI_CONNECTION_MAXIMUM_RETRY
         int "WiFi connection maximum retry"
         range 0 255
         default 2
-        help
-            WiFi connection maximum retry, from 0 to 255.
 
+    choice I2C_ADDRESS
+        prompt "Select I2C address"
+        default I2C_ADDRESS_LO
+
+        config I2C_ADDRESS_LO
+            bool "BH1750_ADDR_LO"
+
+        config I2C_ADDRESS_HI
+            bool "BH1750_ADDR_HI"
+    endchoice
+
+    config I2C_MASTER_SCL
+        int "SCL GPIO Number"
+        default 26
+
+    config I2C_MASTER_SDA
+        int "SDA GPIO Number"
+        default 25
+
+    config DHT11_DATA_GPIO
+        int "DHT11 GPIO Number"
+        default 16
+
+    config LOWER_BUTTON_GPIO
+        int "Lower button GPIO Number"
+        default 35
+        
+    choice TEMPORAL_BASE_URL
+        prompt "Select temporal base url"
+        default TEMPORAL_BASE_URL_DEV
+
+        config TEMPORAL_BASE_URL_DEV
+            bool "development"
+        config TEMPORAL_BASE_URL_PROD
+            bool "production"
+    endchoice
+
+    config MAC_KEY
+        string "NVS key MAC"
+        default "MAC_KEY"
+    
+    config TOKEN_KEY
+        string "NVS token MAC"
+        default "TOKEN_KEY"
+
+    config DEEP_SLEEP_DURATION
+        int "Deep sleep duration (seconds)"
+        default 1800
 endmenu
