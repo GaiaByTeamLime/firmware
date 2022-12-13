@@ -51,7 +51,7 @@ static const char *TAG = "HTTP_CLIENT";
 
 #define LOWER_BUTTON GPIO_NUM_35
 #define TOKEN_LENGTH 36
-#define DEEP_SLEEP_DURATION 30 * 60
+#define DEEP_SLEEP_DURATION 3600000000
 #define TOKEN_KEY "token_id"
 #define MAC_KEY "mac_key"
 #define TEMPORAL_BASE_URL "https://temporal.dev.gaiaplant.app"
@@ -659,6 +659,7 @@ static struct dht11_reading stDht11Reading;
 
 void app_main(void)
 {
+
     esp_err_t ret;
 
     // Set lower button to input mode
@@ -702,9 +703,6 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Start wifi
-    initialise_wifi();
-
     // Read if we have a token
     nvs_handle_t nvs;
     ret = nvs_open("storage", NVS_READWRITE, &nvs);
@@ -727,6 +725,10 @@ void app_main(void)
 
     if (ret == ESP_OK)
     {
+
+        // Start wifi
+        initialise_wifi();
+
         // Connect to server and enter deepsleep directly.
         printf("Token value: %s\n", token);
         printf("Mac value: %s\n", mac);
@@ -813,9 +815,16 @@ void app_main(void)
 
         printf("Post data is %s\n", post_data);
 
+        int wait = 100;
         while (!gl_sta_got_ip)
         {
             vTaskDelay(10);
+            if (wait-- < 1)
+            {
+                // Enter deep sleep
+                ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION));
+                esp_deep_sleep_start();
+            }
         }
 
         esp_http_client_config_t config = {
@@ -846,13 +855,29 @@ void app_main(void)
         free(mac);
 
         // Enter deep sleep
-        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION * 1000000));
+        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION));
         esp_deep_sleep_start();
     }
     else
     {
         free(token);
         free(mac);
+
+        switch (esp_sleep_get_wakeup_cause())
+        {
+        case ESP_SLEEP_WAKEUP_TIMER:
+            printf("Wakeup caused by timer, suya");
+            ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION));
+            esp_deep_sleep_start();
+            break;
+        default:
+            printf("Wakeup was not caused by deep sleep: %d\n", esp_sleep_get_wakeup_cause());
+            break;
+        }
+
+        // Start wifi
+        initialise_wifi();
+
         BLUFI_ERROR("%s read token failed.\n", __func__);
 
         // Continue with enabling bluetooth
@@ -882,10 +907,12 @@ void app_main(void)
         BLUFI_INFO("BLUFI VERSION %04x\n", esp_blufi_get_version());
 
         // Delay for 5 minutes
-        vTaskDelay(5 * 60 * 1000 / portTICK_PERIOD_MS);
+        vTaskDelay(300000 / portTICK_PERIOD_MS);
+
+        BLUFI_INFO("Entering deep sleep. Slaap lekker.");
 
         // Enter deep sleep
-        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION * 1000000));
+        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION));
         esp_deep_sleep_start();
     }
 }
