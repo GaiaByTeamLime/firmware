@@ -40,6 +40,7 @@
 #include "esp_bt_device.h"
 #include "dht11.h"
 #include <driver/adc.h>
+#include "gaia.h"
 
 #define MAX_HTTP_RECV_BUFFER 512
 #define MAX_HTTP_OUTPUT_BUFFER 2048
@@ -50,10 +51,7 @@ static const char *TAG = "HTTP_CLIENT";
 #define EXAMPLE_INVALID_RSSI -128
 
 #define LOWER_BUTTON GPIO_NUM_35
-#define TOKEN_LENGTH 36
 #define DEEP_SLEEP_DURATION 3600000000
-#define TOKEN_KEY "token_id"
-#define MAC_KEY "mac_key"
 #define TEMPORAL_BASE_URL "https://temporal.dev.gaiaplant.app"
 #define SENSOR_TYPE DHT_TYPE_DHT11
 #define DHT11_DATA_GPIO GPIO_NUM_16
@@ -584,52 +582,13 @@ static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_para
         BLUFI_INFO("Recv Custom Data %d\n", param->custom_data.data_len);
         esp_log_buffer_hex("Custom Data", param->custom_data.data, param->custom_data.data_len);
 
-        if (param->custom_data.data_len != TOKEN_LENGTH)
+        if (param->custom_data.data_len != (TOKEN_LENGTH + SID_LENGTH))
         {
-            printf("Custom data is not a token! length=%d\n", param->custom_data.data_len);
+            printf("Custom data is not a token+sid combo! length=%d\n", param->custom_data.data_len);
             break;
         }
 
-        printf("Opening Non-Volatile Storage (NVS) handle... ");
-        nvs_handle_t nvs;
-        esp_err_t ret = nvs_open("storage", NVS_READWRITE, &nvs);
-        if (ret != ESP_OK)
-        {
-            printf("Error (%s) opening NVS handle!\n", esp_err_to_name(ret));
-            break;
-        }
-        printf("Done\n");
-
-        char token[TOKEN_LENGTH + 1] = {0};
-        strncpy(token, (char *)param->custom_data.data, TOKEN_LENGTH);
-        token[TOKEN_LENGTH] = '\0';
-        printf("Token set to %s!\n", token);
-
-        // Write
-        printf("Updating token in NVS ... ");
-        ret = nvs_set_str(nvs, TOKEN_KEY, token);
-        printf((ret != ESP_OK) ? "Failed!\n" : "Done\n");
-
-        char mac[50] = {0};
-        sprintf(mac, ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(esp_bt_dev_get_address()));
-        BLUFI_INFO("MAC: %s\n", mac);
-
-        // Write
-        printf("Updating mac in NVS ... ");
-        ret = nvs_set_str(nvs, MAC_KEY, mac);
-        printf((ret != ESP_OK) ? "Failed!\n" : "Done\n");
-
-        // Commit written value.
-        // After setting any values, nvs_commit() must be called to ensure changes are written
-        // to flash storage. Implementations may write to storage at other times,
-        // but this is not guaranteed.
-        printf("Committing updates in NVS ... ");
-        ret = nvs_commit(nvs);
-        printf((ret != ESP_OK) ? "Failed!\n" : "Done\n");
-
-        // Close
-        nvs_close(nvs);
-        esp_restart();
+        set_token((char *)param->custom_data.data);
         break;
     case ESP_BLUFI_EVENT_RECV_USERNAME:
         /* Not handle currently */
@@ -717,8 +676,8 @@ void app_main(void)
     char *token = malloc(required_size);
     ret = nvs_get_str(nvs, TOKEN_KEY, token, &required_size);
 
-    char *mac = malloc(required_size);
-    ret += nvs_get_str(nvs, MAC_KEY, mac, &required_size);
+    char *sid = malloc(required_size);
+    ret += nvs_get_str(nvs, SID_KEY, sid, &required_size);
 
     // Close
     nvs_close(nvs);
@@ -731,7 +690,7 @@ void app_main(void)
 
         // Connect to server and enter deepsleep directly.
         printf("Token value: %s\n", token);
-        printf("Mac value: %s\n", mac);
+        printf("Sid value: %s\n", sid);
 
         // FIRST ENABLE THE SENSORS JESSE
         gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
@@ -787,7 +746,7 @@ void app_main(void)
         }
 
         adc1_config_width(ADC_WIDTH_BIT_12);
-        adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_11); // capacitibe
+        adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_11); // capacitive
         adc1_config_channel_atten(ADC1_CHANNEL_5, ADC_ATTEN_DB_11); // vbat
         adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_0);  // resistive
 
@@ -795,13 +754,12 @@ void app_main(void)
         int bat = adc1_get_raw(ADC1_CHANNEL_5);
         int soil_salt = adc1_get_raw(ADC1_CHANNEL_6);
 
-        // ESP_LOGI(TAG, "ADC1_CHANNEL_4: %d mV", adc1_get_raw(ADC1_CHANNEL_4));
-        printf("yoo %d\n", soil_humid);
-        // ESP_LOGI(TAG, "ADC1_CHANNEL_5: %d mV", adc1_get_raw(ADC1_CHANNEL_5));
-        printf("yoo %d\n", bat);
+        printf("capacitive %d\n", soil_humid);
+        printf("vbat %d\n", bat);
+        printf("resistive %d\n", soil_salt);
 
         char url[100];
-        sprintf(url, "%s/log/%s", TEMPORAL_BASE_URL, mac);
+        sprintf(url, "%s/log/%s", TEMPORAL_BASE_URL, sid);
         printf("Url is %s\n", url);
 
         char auth_header[100];
@@ -852,7 +810,7 @@ void app_main(void)
         esp_http_client_cleanup(client);
 
         free(token);
-        free(mac);
+        free(sid);
 
         // Enter deep sleep
         ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION));
@@ -861,7 +819,7 @@ void app_main(void)
     else
     {
         free(token);
-        free(mac);
+        free(sid);
 
         switch (esp_sleep_get_wakeup_cause())
         {
